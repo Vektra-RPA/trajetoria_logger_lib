@@ -1,0 +1,28 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trajetoria_logger"
+version = "1.0.0"
+description = "Lib responsável por garantir a entrega de log entre aplicação e API"
+readme = "README.md"
+
+authors = [
+  { name = "Trajetoria Consultoria", email = "lucasdaniel@trajetoriaconsultoria.com.br" }
+]
+
+requires-python = ">=3.12"
+license = { text = "MIT" }
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent"
+]
+
+dependencies = []
+
+[tool.setuptools.packages.find]
+include = ["rpa_logger*"]
+exclude = ["tests*"]
