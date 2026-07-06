@@ -13,7 +13,7 @@ setuptools.setup(
     description="Lib responsável por garantir a entrega de log entre aplicação e API",
     long_description=long_description,
     long_description_content_type="text/markdown",
-    packages=setuptools.find_namespace_packages(include=['trajetoria_logger*']),
+    packages=setuptools.find_packages(),
     install_requires=[],
     classifiers=[
         "Programming Language :: Python :: 3",
