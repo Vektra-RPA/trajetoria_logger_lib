@@ -1,4 +1,14 @@
-"""rpa_logger — biblioteca de logging + kill switch para RPAs (base de testes, Opção B)."""
+"""trajetoria_logger — logging com garantia de entrega + kill switch para RPAs.
+
+Uso mínimo:
+
+    from trajetoria_logger import RPALoggerClient, RPALoggerConfig, RPALicenseError
+
+    client = RPALoggerClient(RPALoggerConfig(api_key="...", api_base_url="https://..."))
+    client.info("robô iniciou", task="exemplo")
+    client.raise_if_inactive()      # checkpoint do kill switch entre etapas
+    client.close()                  # drena o buffer antes de sair
+"""
 from .client import (
     LEVEL_CRITICAL,
     LEVEL_DEBUG,
@@ -20,3 +30,5 @@ __all__ = [
     "LEVEL_INFO",
     "LEVEL_DEBUG",
 ]
+
+__version__ = "1.1.0"

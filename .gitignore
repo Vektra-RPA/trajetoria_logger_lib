@@ -138,3 +138,8 @@ dmypy.json
 cython_debug/
 test-output.xml
 test-output.xml
+
+# Buffer local da lib (store-and-forward). NUNCA versionar: contem logs do cliente.
+*.db
+*.db-wal
+*.db-shm

@@ -1,5 +1,3 @@
-# Dependências da LIB rpa_logger (o que os RPAs instalam para importar).
-pika>=1.3            # publish no RabbitMQ com publisher confirms
-requests>=2.31      # valida a chave/licença na API (HTTP simples)
-python-dotenv>=1.0  # carregar .env (configuração do RPA)
-setuptools>=83.0.0
+# Dependências da LIB (o que os RPAs instalam para importar `trajetoria_logger`).
+# Preferir `pip install ./rpa_logger` — este arquivo existe para instalação avulsa/pin.
+requests>=2.31      # único canal de saída da lib: HTTPS para a nossa API

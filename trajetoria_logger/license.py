@@ -1,70 +1,129 @@
-"""Kill switch (seção 5.4 do spec, REVISADO). Requisito R2.
+"""Kill switch (R2): fail-open COM VALIDADE.
 
-Regra do kill switch (revisada com o usuário) — bem mais simples e leniente:
+Esta classe é POLÍTICA PURA — não faz HTTP (isso é do `transport.py`). Ela recebe
+snapshots do servidor e decide uma única coisa: a execução deve parar?
 
-  * 200 active=true   -> OK. Guarda robot_id, rabbitmq_url (entregue pela API) e last_ok.
-  * 200 active=false  -> RPALicenseError. É a ÚNICA condição de parada (chave inativa).
-  * 404 (inexistente) -> NÃO para. A chave pode ter sido alterada/rotacionada; não
-                         derrubamos a execução do robô por isso.
-  * erro de rede/timeout/5xx -> NÃO para (fail-open). Sem resposta explícita de "inativa",
-                         o robô continua; o log degrada para o buffer local e é enviado
-                         depois (fila bulk) quando a conexão voltar.
+A distinção que não pode ser relaxada:
+  * `active=False` (resposta EXPLÍCITA)  -> para na hora. Cliente cancelou.
+  * SEM resposta (rede fora, 404, 5xx)   -> NÃO para de imediato. Pode ser só instabilidade
+                                            de rede, e derrubar cliente pagante por isso é
+                                            o pior erro possível aqui.
 
-Ou seja: só uma resposta EXPLÍCITA de "inativa" interrompe o robô. Tudo mais → continua.
+O que a versão anterior não tinha: o fail-open era INFINITO — API fora para sempre
+significava robô rodando para sempre. Agora existe um "passe com validade":
+
+    para  <=>  active=False  OU  (agora - último_ok) > graça
+
+A graça vem do servidor (`lease_seconds`, que assim controla a política comercialmente) e
+cai para `license_grace_hours` do config enquanto o servidor nunca respondeu.
+
+`last_ok` é PERSISTIDO no buffer (tabela `meta`): sem isso, reiniciar o robô zeraria o
+prazo e o fail-open voltaria a ser infinito na prática.
+
+Robô que NUNCA validou (primeira execução, API inacessível) roda ancorado no `first_seen`
+— ou seja, ele inicia, mas não passa da graça sem nunca ter falado com a API.
 """
 from __future__ import annotations
 
 import threading
 import time
 
-import requests
+from .buffer import Buffer
+from .transport import LicenseSnapshot
+
+_META_LAST_OK = "license_last_ok"
+_META_LEASE = "license_lease_seconds"
+_META_FIRST_SEEN = "license_first_seen"
 
 
 class RPALicenseError(Exception):
-    """Levantada quando a execução do RPA deve ser interrompida (chave inativa)."""
+    """Levantada quando a execução do RPA deve ser interrompida."""
 
 
-class LicenseValidator:
-    def __init__(self, api_base_url: str, api_key: str):
-        self._url = f"{api_base_url.rstrip('/')}/keys/{api_key}/status"
+class LicenseGuard:
+    def __init__(self, buffer: Buffer, grace_hours: float, robot_id_fallback: str = ""):
+        self._buffer = buffer
         self._lock = threading.Lock()
-        self._last_ok: float | None = None
-        self._robot_id: str | None = None
-        self._rabbitmq_url: str | None = None  # conexão do Rabbit entregue pela API
+        self._default_grace = max(0.0, float(grace_hours) * 3600.0)
+        self._robot_id = robot_id_fallback or None
+        # None = ainda não houve resposta explícita nesta execução.
+        self._active: bool | None = None
 
+        self._last_ok = _read_float(buffer, _META_LAST_OK)
+        self._lease = _read_float(buffer, _META_LEASE)
+        first_seen = _read_float(buffer, _META_FIRST_SEEN)
+        if first_seen is None:
+            first_seen = time.time()
+            buffer.set_meta(_META_FIRST_SEEN, repr(first_seen))
+        self._first_seen = first_seen
+
+    # ------------------------------------------------------------------ leitura
     @property
     def robot_id(self) -> str | None:
         with self._lock:
             return self._robot_id
 
     @property
-    def rabbitmq_url(self) -> str | None:
-        with self._lock:
-            return self._rabbitmq_url
-
-    @property
     def last_ok(self) -> float | None:
         with self._lock:
             return self._last_ok
 
-    def verify(self) -> None:
-        """Valida a chave. Levanta RPALicenseError SOMENTE se a chave estiver inativa."""
-        try:
-            resp = requests.get(self._url, timeout=5)
-        except requests.RequestException:
-            # API inacessível: sem resposta explícita -> não para (fail-open).
+    def seconds_left(self) -> float:
+        """Quanto tempo ainda pode rodar sem confirmação da API (inf se confirmada agora)."""
+        with self._lock:
+            return self._seconds_left_locked()
+
+    # ------------------------------------------------------------------ escrita
+    def record(self, snapshot: LicenseSnapshot | None) -> None:
+        """Aplica o que o servidor disse. `None` = não disse nada: estado preservado."""
+        if snapshot is None:
             return
-
-        if resp.status_code == 200:
-            data = resp.json()
-            if data.get("active") is True:
-                with self._lock:
-                    self._last_ok = time.time()
-                    self._robot_id = data.get("robot_id") or self._robot_id
-                    self._rabbitmq_url = data.get("rabbitmq_url") or self._rabbitmq_url
+        with self._lock:
+            if snapshot.robot_id:
+                self._robot_id = snapshot.robot_id
+            if not snapshot.active:
+                self._active = False  # resposta explícita: decisão final
                 return
-            # Resposta explícita: chave inativa -> ÚNICA condição de parada.
-            raise RPALicenseError("Chave desativada — execução interrompida.")
+            self._active = True
+            self._last_ok = time.time()
+            if snapshot.lease_seconds is not None:
+                self._lease = float(snapshot.lease_seconds)
+                self._buffer.set_meta(_META_LEASE, repr(self._lease))
+            self._buffer.set_meta(_META_LAST_OK, repr(self._last_ok))
 
-        # 404 (inexistente) ou outro status (5xx etc.): não é "inativa" -> não para.
-        return
+    # ------------------------------------------------------------------ decisão
+    def stop_reason(self) -> str | None:
+        """Motivo para parar, ou None para continuar."""
+        with self._lock:
+            if self._active is False:
+                return "Chave desativada — execução interrompida."
+            if self._seconds_left_locked() <= 0:
+                grace_h = self._grace_locked() / 3600.0
+                return (
+                    "Não foi possível validar a licença dentro do período de graça "
+                    f"({grace_h:.1f}h) — execução interrompida."
+                )
+            return None
+
+    def raise_if_stopped(self) -> None:
+        reason = self.stop_reason()
+        if reason:
+            raise RPALicenseError(reason)
+
+    # ------------------------------------------------------------------ interno
+    def _grace_locked(self) -> float:
+        return self._lease if self._lease is not None else self._default_grace
+
+    def _seconds_left_locked(self) -> float:
+        anchor = self._last_ok if self._last_ok is not None else self._first_seen
+        return self._grace_locked() - (time.time() - anchor)
+
+
+def _read_float(buffer: Buffer, key: str) -> float | None:
+    raw = buffer.get_meta(key)
+    if raw is None:
+        return None
+    try:
+        return float(raw)
+    except (TypeError, ValueError):
+        return None

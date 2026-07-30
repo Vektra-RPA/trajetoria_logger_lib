@@ -1,14 +1,16 @@
-"""Cliente que o RPA usa (seção 5.5, revisada) + worker interno.
+"""Cliente que o RPA usa + worker interno.
 
-Fluxo (revisado):
-  - No boot, valida a chave na API. Se a API responder EXPLICITAMENTE active=false, o
-    construtor levanta RPALicenseError e o robô não inicia. Qualquer outro caso (ativa,
-    inexistente, API fora) -> o robô inicia (fail-open).
-  - Ao validar uma chave ativa, a API entrega a `rabbitmq_url`; a lib passa a publicar.
-  - log() SEMPRE grava no buffer local primeiro (R1). O worker drena:
-      * logs desta execução           -> fila padrão (rpa.log.<level>)
-      * logs de execuções ANTERIORES  -> fila bulk   (rpa.bulk.<level>)
-  - Kill switch cooperativo (seção 9): is_active + raise_if_inactive(), sem sys.exit().
+Fluxo:
+  - No boot, valida a chave na API. Para (RPALicenseError) em DOIS casos: a API responde
+    `active=false`, ou não há resposta E o período de graça já expirou (ver license.py).
+  - `log()` SEMPRE grava no buffer local primeiro (R1) e retorna. Nenhuma I/O de rede
+    acontece na thread do RPA.
+  - O worker drena o buffer em BATCHES via `POST /logs/batch`. Um log só sai do buffer
+    quando a API confirma aquele `log_id` (ou o rejeita permanentemente).
+  - Kill switch cooperativo: `is_active` + `raise_if_inactive()`, sem `sys.exit()`.
+
+A lib não conhece mais o RabbitMQ: quem publica no broker é a API. O `robot_id` também
+deixou de ser enviado — o servidor o deriva da chave, então não é forjável pelo cliente.
 """
 from __future__ import annotations
 
@@ -18,8 +20,8 @@ import uuid
 
 from .buffer import Buffer
 from .config import RPALoggerConfig
-from .license import LicenseValidator, RPALicenseError
-from .publisher import Publisher
+from .license import LicenseGuard, RPALicenseError
+from .transport import HttpTransport, LicenseSnapshot
 
 LEVEL_CRITICAL = 1
 LEVEL_ERROR = 2
@@ -27,27 +29,42 @@ LEVEL_WARNING = 3
 LEVEL_INFO = 4
 LEVEL_DEBUG = 5
 
+_BACKOFF_START = 1.0
+_BACKOFF_MAX = 30.0
+# Piso entre chamadas de licença: protege a API de ser martelada se o intervalo
+# configurado for absurdamente baixo (ou zero).
+_MIN_LICENSE_INTERVAL = 5.0
+
 
 class RPALoggerClient:
     def __init__(self, config: RPALoggerConfig):
         self._config = config
-        # Identifica ESTA execução: distingue os logs atuais (fila padrão) do backlog de
-        # execuções anteriores que ficaram no buffer (fila bulk).
+        # Identifica ESTA execução: o servidor usa isso para separar o stream em tempo
+        # real do backlog de execuções anteriores que ficaram no buffer.
         self._execution_id = str(uuid.uuid4())
 
-        self._buffer = Buffer(config.buffer_path)
-        self._publisher = Publisher()  # a URL do Rabbit virá da API
-        self._license = LicenseValidator(config.api_base_url, config.api_key)
+        self._buffer = Buffer(config.buffer_path, config.max_buffered_logs)
+        self._transport = HttpTransport(
+            config.api_base_url,
+            config.api_key,
+            timeout=config.http_timeout_seconds,
+            verify_tls=config.verify_tls,
+        )
+        self._license = LicenseGuard(self._buffer, config.license_grace_hours)
 
-        # Boot: só PARA se a API disser explicitamente que a chave está inativa.
+        self._license_interval = max(
+            _MIN_LICENSE_INTERVAL, float(config.license_check_interval_minutes) * 60.0
+        )
+        self._next_license_check = 0.0
+
+        # Boot: valida antes de qualquer coisa. Se tiver que parar, não deixa recurso aberto.
         try:
-            self._license.verify()  # pode levantar RPALicenseError (chave inativa)
-        except Exception:
+            self._license.record(self._transport.fetch_license())
+            self._license.raise_if_stopped()
+        except BaseException:
+            self._transport.close()
             self._buffer.close()
             raise
-        self._robot_id = self._license.robot_id or config.api_key
-        if self._license.rabbitmq_url:
-            self._publisher.update_url(self._license.rabbitmq_url)
 
         self._active = threading.Event()
         self._active.set()
@@ -61,11 +78,11 @@ class RPALoggerClient:
     def log(self, message: str, level: int = LEVEL_INFO, **context) -> None:
         entry = {
             "log_id": str(uuid.uuid4()),
-            "robot_id": self._robot_id,
             "level": int(level),
             "message": str(message),
             "timestamp": time.time(),
             "context": context or {},
+            "execution_id": self._execution_id,
         }
         self._buffer.add(entry, self._execution_id)  # SEMPRE grava local primeiro (R1)
 
@@ -88,62 +105,107 @@ class RPALoggerClient:
     def is_active(self) -> bool:
         return self._active.is_set()
 
+    @property
+    def robot_id(self) -> str | None:
+        """Quem o servidor diz que somos (só conhecido após uma validação bem-sucedida)."""
+        return self._license.robot_id
+
+    @property
+    def execution_id(self) -> str:
+        return self._execution_id
+
+    @property
+    def pending_logs(self) -> int:
+        """Logs ainda não confirmados pela API (inclui backlog de execuções anteriores)."""
+        return self._buffer.count()
+
     def raise_if_inactive(self) -> None:
         """Checkpoint cooperativo do kill switch: o RPA chama entre etapas."""
         if not self._active.is_set():
+            self._license.raise_if_stopped()
+            # Estado inconsistente (flag caiu mas a política já não pede parada):
+            # a mensagem genérica preserva o contrato de interromper a execução.
             raise RPALicenseError("Licença revogada — execução interrompida.")
 
-    def close(self, drain_timeout: float = 10.0) -> None:
-        """Tenta drenar o buffer antes de encerrar; depois para o worker."""
-        deadline = time.time() + drain_timeout
+    def close(self, drain_timeout: float = 10.0) -> int:
+        """Tenta drenar o buffer antes de encerrar; depois para o worker.
+
+        Devolve quantos logs continuam NÃO confirmados. Diferente de zero não é perda: eles
+        ficam no arquivo do buffer e sobem na próxima execução do robô (fila bulk).
+        """
+        deadline = time.time() + max(0.0, drain_timeout)
         while time.time() < deadline and self._buffer.count() > 0:
             time.sleep(0.2)  # o worker (ainda vivo) continua drenando
+        remaining = self._buffer.count()
         self._stop.set()
-        self._worker.join(timeout=5.0)  # o worker fecha o publisher ao sair
+        # O worker pode estar dentro de um POST: espera o suficiente para ele sair sozinho
+        # antes de fechar o SQLite embaixo dele.
+        self._worker.join(timeout=self._config.http_timeout_seconds + 5.0)
+        self._transport.close()
         self._buffer.close()
+        return remaining
 
     # ------------------------------------------------------------------ worker interno
+    def _warn(self, message: str) -> None:
+        hook = self._config.on_warning
+        if hook is None:
+            return
+        try:
+            hook(message)
+        except Exception:
+            pass  # o hook é da aplicação: um erro nele não pode derrubar o worker
+
+    def _apply_license(self, snapshot: LicenseSnapshot | None) -> None:
+        if snapshot is None:
+            return
+        self._license.record(snapshot)
+        # Resposta explícita (inclusive a que vem "de carona" no POST) conta como
+        # verificação: adia o GET periódico.
+        self._next_license_check = time.time() + self._license_interval
+        reason = self._license.stop_reason()
+        if reason:
+            self._active.clear()  # parada cooperativa; quem decide sair é o RPA
+            self._warn(reason)
+
+    def _check_license_deadline(self) -> None:
+        """Sem resposta há tempo demais -> a graça expira e a execução deve parar."""
+        reason = self._license.stop_reason()
+        if reason and self._active.is_set():
+            self._active.clear()
+            self._warn(reason)
+
     def _run_worker(self) -> None:
-        backoff = 1.0
-        interval = self._config.license_check_interval_minutes * 60.0
-        last_license_check = time.time()
+        backoff = _BACKOFF_START
+        self._next_license_check = time.time() + self._license_interval
         try:
             while not self._stop.is_set():
-                # Revalida a licença quando: (a) chegou o intervalo, ou (b) ainda não temos
-                # a URL do Rabbit (precisamos obtê-la da API para conseguir publicar).
-                if (not self._publisher.has_url()) or (
-                    time.time() - last_license_check >= interval
-                ):
-                    last_license_check = time.time()
-                    try:
-                        self._license.verify()
-                        self._publisher.update_url(self._license.rabbitmq_url)
-                    except RPALicenseError:
-                        self._active.clear()  # parada cooperativa (chave ficou inativa)
+                if time.time() >= self._next_license_check:
+                    self._next_license_check = time.time() + self._license_interval
+                    self._apply_license(self._transport.fetch_license())
+                self._check_license_deadline()
 
-                pending = self._buffer.get_pending(limit=100)
-                if not pending:
-                    self._stop.wait(1.0)
+                entries = self._buffer.get_pending(limit=self._config.batch_size)
+                if not entries:
+                    self._stop.wait(self._config.flush_interval_seconds)
                     continue
 
-                progress = False
-                for execution_id, entry in pending:
-                    if self._stop.is_set():
-                        break
-                    # Logs de execuções anteriores (buffer sobreviveu a um run sem Rabbit)
-                    # vão para a fila bulk; os desta execução vão para a fila padrão.
-                    bulk = execution_id != self._execution_id
-                    if self._publisher.publish(entry, bulk=bulk):
-                        self._buffer.mark_sent(entry["log_id"])  # só após confirm (R1)
-                        progress = True
-                    else:
-                        self._buffer.increment_attempts(entry["log_id"])
+                result = self._transport.send_batch(self._execution_id, entries)
+                self._apply_license(result.license)
 
-                if progress:
-                    backoff = 1.0
-                else:
-                    # nada saiu (sem URL / broker fora): backoff exponencial.
-                    self._stop.wait(backoff)
-                    backoff = min(backoff * 2, 30.0)
+                settled = set(result.accepted) | set(result.dropped)
+                if settled:
+                    self._buffer.mark_sent(settled)  # só após confirmação (R1)
+                for log_id, reason in result.dropped.items():
+                    self._warn(f"log {log_id} descartado pela API: {reason}")
+
+                if result.accepted:
+                    backoff = _BACKOFF_START
+                    continue  # provavelmente há mais backlog: envia o próximo batch já
+
+                self._buffer.increment_attempts([e["log_id"] for e in entries])
+                if result.error:
+                    self._warn(f"envio falhou (logs preservados no buffer): {result.error}")
+                self._stop.wait(result.retry_after or backoff)
+                backoff = min(backoff * 2, _BACKOFF_MAX)
         finally:
-            self._publisher.close()
+            self._transport.close()
