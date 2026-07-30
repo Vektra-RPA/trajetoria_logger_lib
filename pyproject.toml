@@ -1,0 +1,46 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "trajetoria-logger"
+version = "2.0.0"
+description = "Logging com garantia de entrega (buffer local + confirmação) e kill switch para RPAs"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+
+authors = [
+  { name = "Trajetoria Consultoria", email = "lucasdaniel@trajetoriaconsultoria.com.br" }
+]
+
+# A lib fala com a nossa API por HTTPS e mais nada. `pika` saiu junto com o publish
+# direto no broker; `python-dotenv` nunca foi usado (é a APLICAÇÃO que carrega o .env).
+dependencies = [
+  "requests>=2.31",
+]
+
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "License :: OSI Approved :: MIT License",
+  "Operating System :: OS Independent",
+]
+
+[project.optional-dependencies]
+# `python-dotenv` fica só aqui, e de propósito: quem carrega o .env é a APLICAÇÃO, nunca a
+# lib. Os exemplos em `examples/` fazem esse papel de aplicação, então precisam dele —
+# instale com `pip install -e ".[dev]"` para rodá-los.
+dev = [
+  "pytest>=8.0",
+  "pytest-cov>=5.0",
+  "python-dotenv>=1.0",
+]
+
+[tool.setuptools.packages.find]
+# O pacote importável é `trajetoria_logger` (este diretório é a raiz da distribuição).
+include = ["trajetoria_logger*"]
+exclude = ["tests*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"

@@ -1,0 +1,3 @@
+# Dependências da LIB (o que os RPAs instalam para importar `trajetoria_logger`).
+# Preferir `pip install ./rpa_logger` — este arquivo existe para instalação avulsa/pin.
+requests>=2.31      # único canal de saída da lib: HTTPS para a nossa API
