@@ -1,0 +1,10 @@
+# Normaliza todo arquivo de texto para LF no repositorio (o working tree segue o
+# core.autocrlf de cada maquina). Mantem o historico limpo entre Windows e Linux.
+* text=auto
+
+# ATENCAO: isto NAO protege contra encoding errado. UTF-16 tem bytes NUL, entao o
+# `text=auto` classifica o arquivo como BINARIO e passa reto — foi assim que um
+# README.md em UTF-16LE chegou a ser publicado na v1.1.0 e derrubou o `pip install`
+# em todas as maquinas (o setuptools le o readme como UTF-8 ao montar o wheel).
+# O diff aparecia como "Bin 25768 -> 13230 bytes", escondendo o problema.
+# Para barrar de fato, use uma verificacao de decodificacao em UTF-8 no CI/pre-commit.
