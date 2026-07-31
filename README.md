@@ -22,7 +22,29 @@ seu RPA → trajetoria_logger (buffer SQLite) ──HTTPS POST /logs/batch──
 ## Instalação
 
 ```bash
-pip install git+ssh://git@github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.0
+pip install "git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.0"
+```
+
+HTTPS **não pede credencial** — o repositório é público para leitura. O `@v1.1.0` fixa a
+versão. Requer `git` instalado: o pip clona o repositório e monta o pacote na máquina.
+
+> **Não use `git+ssh://`.** SSH exige chave autorizada na organização mesmo com o repositório
+> público — quem pede a chave é o protocolo, não a permissão do repo. Em máquina de cliente
+> isso falha com `Permission denied (publickey)`.
+
+Se a máquina não tem `git`, ou não tem saída para o GitHub, instale pelo wheel. Ele é
+`py3-none-any`, então o mesmo arquivo serve Windows e Linux:
+
+```bash
+pip install ./trajetoria_logger-1.1.0-py3-none-any.whl
+```
+
+Gere o wheel com `python -m build --wheel` (sai em `dist/`). Para uma máquina que também não
+alcança o PyPI, junte no mesmo diretório os wheels de `requests`, `urllib3`, `idna`, `certifi`
+e `charset_normalizer` (`pip download requests`) e instale sem rede:
+
+```bash
+pip install --no-index --find-links ./dist requests trajetoria-logger
 ```
 
 Ou, a partir de um clone local:
