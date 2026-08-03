@@ -22,10 +22,10 @@ seu RPA → trajetoria_logger (buffer SQLite) ──HTTPS POST /logs/batch──
 ## Instalação
 
 ```bash
-pip install "git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.0"
+pip install "git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.1"
 ```
 
-HTTPS **não pede credencial** — o repositório é público para leitura. O `@v1.1.0` fixa a
+HTTPS **não pede credencial** — o repositório é público para leitura. O `@v1.1.1` fixa a
 versão. Requer `git` instalado: o pip clona o repositório e monta o pacote na máquina.
 
 > **Não use `git+ssh://`.** SSH exige chave autorizada na organização mesmo com o repositório
@@ -36,7 +36,7 @@ Se a máquina não tem `git`, ou não tem saída para o GitHub, instale pelo whe
 `py3-none-any`, então o mesmo arquivo serve Windows e Linux:
 
 ```bash
-pip install ./trajetoria_logger-1.1.0-py3-none-any.whl
+pip install ./trajetoria_logger-1.1.1-py3-none-any.whl
 ```
 
 Gere o wheel com `python -m build --wheel` (sai em `dist/`). Para uma máquina que também não
@@ -202,6 +202,8 @@ finally:
 | `api_key` | `str` | — | **Obrigatório.** Chave do robô. Determina o `robot_id` no servidor. |
 | `api_base_url` | `str` | — | **Obrigatório.** Base da API, ex.: `https://logs.suaempresa.com`. |
 | `buffer_path` | `str` | `"./rpa_buffer.db"` | Arquivo do buffer local. Use caminho absoluto. |
+| `log_timezone` | `str` | `"America/Sao_Paulo"` | Fuso em que o `created_at` do buffer é gravado. Ver [Fuso horário](#fuso-horário). |
+| `log_utc_offset_hours` | `float` | `-3.0` | Offset usado quando a máquina não tem a base IANA (Windows sem `tzdata`). |
 | `license_grace_hours` | `float` | `24.0` | Quanto tempo o robô pode rodar **sem** conseguir validar a chave. Só vale enquanto o servidor nunca respondeu — depois quem manda é o prazo do servidor. |
 | `license_check_interval_minutes` | `float` | `30.0` | Intervalo de revalidação. Piso interno de 5s: valores menores são elevados. |
 | `batch_size` | `int` | `500` | Logs por requisição. **Não passe de 1000** — a API rejeita lotes maiores. |
@@ -219,6 +221,46 @@ finally:
 | `logger.execution_id` | UUID desta execução. Agrupa os logs no banco. |
 | `logger.is_active` | `False` quando o kill switch foi acionado. |
 | `logger.pending_logs` | Logs ainda não confirmados, incluindo backlog de execuções anteriores. |
+
+---
+
+## Fuso horário
+
+Desde a **v1.1.1** o `created_at` do `rpa_buffer.db` é gravado no **fuso local (-03:00)**, em
+texto ISO 8601 com o offset dentro do valor:
+
+```
+2026-08-03T08:58:12.345678-03:00
+```
+
+Antes era epoch UNIX. O instante estava correto, mas qualquer ferramenta que abrisse o arquivo
+o lia como UTC — e um log gravado às **08:58** aparecia como **11:58**.
+
+Cada log carrega **dois** timestamps do mesmo instante, e é de propósito:
+
+| Onde | Formato | Para quê |
+|---|---|---|
+| `created_at` (coluna do buffer) | texto local `-03:00` | leitura humana, ordenação da fila de envio |
+| `timestamp` (dentro do `payload`) | epoch UNIX | é o que trafega para a API e vira `TIMESTAMPTZ` no banco |
+
+O `timestamp` **não** é deslocado. Ele é o instante absoluto que a API valida; somá-lo a um
+offset faria o `logged_at` divergir 3h do `received_at` do servidor e transformaria qualquer
+medida de latência de ingestão em lixo. Quem converte para -03:00 na exibição é a API.
+
+**Buffer de versão anterior é migrado automaticamente** na primeira abertura: a coluna é
+convertida de epoch para texto local sem perder nenhum log pendente, nem o `attempts`, nem o
+estado do kill switch. Nada a fazer manualmente.
+
+Para trocar o fuso (ou rodar em UTC), use a config:
+
+```python
+RPALoggerConfig(..., log_timezone="America/Manaus", log_utc_offset_hours=-4.0)
+```
+
+> No Windows o `zoneinfo` só encontra a base IANA se o pacote `tzdata` estiver instalado.
+> Sem ela a lib usa `log_utc_offset_hours` (-3 por padrão) — que é exatamente o mesmo
+> resultado, já que o Brasil não tem horário de verão desde 2019. Instalar `tzdata` só
+> importa se o horário de verão voltar.
 
 ---
 
