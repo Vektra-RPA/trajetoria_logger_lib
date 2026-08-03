@@ -10,6 +10,13 @@ o servidor usa isso para separar o stream em tempo real do backlog (fila bulk).
 Também guarda o estado do kill switch (tabela `meta`): o `last_ok` da licença precisa
 sobreviver a reinícios, senão cada restart do robô zeraria o período de graça.
 
+FUSO: `created_at` é TEXTO ISO 8601 no fuso local, com o offset dentro do valor
+(`2026-08-03T08:58:12.345678-03:00`), e não epoch. Epoch era ilegível para quem abre o
+arquivo e, lido como UTC, mostrava um log das 08:58 como 11:58. A ordenação não se perde:
+neste formato de largura fixa a ordem lexicográfica É a cronológica, então `ORDER BY
+created_at`, o índice e o corte por excedente seguem valendo. O `timestamp` do payload
+continua epoch — é o que a API valida. Ver `timezones.py`.
+
 DECISÕES de desempenho (o volume real chega a dezenas de milhares de logs por etapa):
   * WAL + synchronous=NORMAL: `log()` é chamado no caminho quente do RPA e commita a cada
     chamada. Em WAL/NORMAL o commit não paga fsync, e os dados sobrevivem a crash do
@@ -24,31 +31,57 @@ import json
 import sqlite3
 import threading
 import time
+from datetime import tzinfo
 from typing import Iterable
+
+from .timezones import (
+    DEFAULT_UTC_OFFSET_HOURS,
+    local_iso,
+    resolve_timezone,
+    sqlite_local_iso,
+)
 
 
 class Buffer:
-    def __init__(self, path: str, max_pending: int = 100_000):
+    def __init__(
+        self,
+        path: str,
+        max_pending: int = 100_000,
+        tz: tzinfo | None = None,
+        utc_offset_hours: float = DEFAULT_UTC_OFFSET_HOURS,
+    ):
         self._path = path
         self._max_pending = int(max_pending)
+        # Fuso em que `created_at` é escrito. Default -03:00 (ver timezones.py).
+        self._tz = tz if tz is not None else resolve_timezone()
         self._lock = threading.Lock()
         self._conn = sqlite3.connect(path, check_same_thread=False)
         self._conn.execute("PRAGMA journal_mode=WAL")
         self._conn.execute("PRAGMA synchronous=NORMAL")
         self._conn.execute("PRAGMA busy_timeout=5000")
+        # O DEFAULT é rede de segurança para INSERT que não informe `created_at`; no caminho
+        # normal quem formata é o Python, a partir do `timestamp` do próprio log (mais fiel:
+        # o instante do log, não o instante do INSERT).
         self._conn.execute(
-            """CREATE TABLE IF NOT EXISTS pending_logs (
+            f"""CREATE TABLE IF NOT EXISTS pending_logs (
                    log_id       TEXT PRIMARY KEY,
                    payload      TEXT NOT NULL,
-                   created_at   REAL NOT NULL,
+                   created_at   TEXT NOT NULL
+                                DEFAULT ({sqlite_local_iso("'now'", utc_offset_hours)}),
                    attempts     INTEGER NOT NULL DEFAULT 0,
                    execution_id TEXT
                )"""
         )
-        # Migração idempotente para bancos criados antes da coluna execution_id.
-        cols = [r[1] for r in self._conn.execute("PRAGMA table_info(pending_logs)").fetchall()]
+        # Migrações idempotentes de bancos antigos. `execution_id` vem primeiro porque a
+        # conversão de `created_at` copia a tabela e precisa da coluna já existindo.
+        cols = {
+            r[1]: (r[2] or "").upper()
+            for r in self._conn.execute("PRAGMA table_info(pending_logs)").fetchall()
+        }
         if "execution_id" not in cols:
             self._conn.execute("ALTER TABLE pending_logs ADD COLUMN execution_id TEXT")
+        if cols.get("created_at") != "TEXT":
+            self._migrate_created_at_to_local(utc_offset_hours)
         self._conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_pending_created_at ON pending_logs (created_at)"
         )
@@ -65,15 +98,19 @@ class Buffer:
         self.add_many([log_dict], execution_id)
 
     def add_many(self, log_dicts: Iterable[dict], execution_id: str) -> None:
-        rows = [
-            (
-                d["log_id"],
-                json.dumps(d, ensure_ascii=False),
-                float(d.get("timestamp") or time.time()),
-                execution_id,
+        rows = []
+        for d in log_dicts:
+            # `created_at` sai do epoch do PRÓPRIO log (não da hora do INSERT): assim um
+            # backlog reinserido mantém o instante em que o log de fato aconteceu.
+            epoch = float(d.get("timestamp") or time.time())
+            rows.append(
+                (
+                    d["log_id"],
+                    json.dumps(d, ensure_ascii=False),
+                    local_iso(epoch, self._tz),
+                    execution_id,
+                )
             )
-            for d in log_dicts
-        ]
         if not rows:
             return
         with self._lock:
@@ -161,6 +198,39 @@ class Buffer:
             self._conn.commit()
 
     # ------------------------------------------------------------------ interno
+    def _migrate_created_at_to_local(self, utc_offset_hours: float) -> None:
+        """Converte `created_at` de epoch (REAL) para texto local, em banco já existente.
+
+        O SQLite não muda o tipo declarado de uma coluna, então a tabela é RECRIADA e as
+        linhas copiadas com o epoch convertido — mesmo instante, escrita nova. Sem isso a
+        coluna ficaria com números e textos misturados, e o SQLite ordena todo número antes
+        de todo texto: o backlog antigo passaria a furar a fila indefinidamente.
+
+        Roda uma vez por arquivo, e só sobre o que ainda está pendente (o que já subiu foi
+        apagado), então é uma cópia curta. `DROP TABLE` leva os índices junto — quem chama
+        recria o índice logo depois.
+        """
+        converted = sqlite_local_iso("created_at", utc_offset_hours, from_epoch=True)
+        self._conn.executescript(
+            f"""
+            BEGIN;
+            CREATE TABLE pending_logs_migrado (
+                log_id       TEXT PRIMARY KEY,
+                payload      TEXT NOT NULL,
+                created_at   TEXT NOT NULL
+                             DEFAULT ({sqlite_local_iso("'now'", utc_offset_hours)}),
+                attempts     INTEGER NOT NULL DEFAULT 0,
+                execution_id TEXT
+            );
+            INSERT INTO pending_logs_migrado
+                   (log_id, payload, created_at, attempts, execution_id)
+            SELECT log_id, payload, {converted}, attempts, execution_id FROM pending_logs;
+            DROP TABLE pending_logs;
+            ALTER TABLE pending_logs_migrado RENAME TO pending_logs;
+            COMMIT;
+            """
+        )
+
     def _enforce_cap_locked(self) -> None:
         excess = self._pending - self._max_pending
         if excess <= 0:

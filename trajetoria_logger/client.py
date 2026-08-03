@@ -21,6 +21,7 @@ import uuid
 from .buffer import Buffer
 from .config import RPALoggerConfig
 from .license import LicenseGuard, RPALicenseError
+from .timezones import resolve_timezone
 from .transport import HttpTransport, LicenseSnapshot
 
 LEVEL_CRITICAL = 1
@@ -43,7 +44,14 @@ class RPALoggerClient:
         # real do backlog de execuções anteriores que ficaram no buffer.
         self._execution_id = str(uuid.uuid4())
 
-        self._buffer = Buffer(config.buffer_path, config.max_buffered_logs)
+        # O `timestamp` do log continua epoch UNIX (é o que a API valida); o fuso abaixo
+        # governa só como o buffer ESCREVE `created_at`. Ver `timezones.py`.
+        self._buffer = Buffer(
+            config.buffer_path,
+            config.max_buffered_logs,
+            tz=resolve_timezone(config.log_timezone, config.log_utc_offset_hours),
+            utc_offset_hours=config.log_utc_offset_hours,
+        )
         self._transport = HttpTransport(
             config.api_base_url,
             config.api_key,
