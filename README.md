@@ -25,6 +25,11 @@ seu RPA → trajetoria_logger (buffer SQLite) ──HTTPS POST /logs/batch──
 pip install "git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.1"
 ```
 
+## Instalação via requirements.txt
+```bash
+trajetoria-logger @ git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.1
+```
+
 HTTPS **não pede credencial** — o repositório é público para leitura. O `@v1.1.1` fixa a
 versão. Requer `git` instalado: o pip clona o repositório e monta o pacote na máquina.
 
