@@ -5,6 +5,7 @@ Demonstra o uso real da biblioteca:
   - emite logs de vários níveis ao longo das etapas;
   - chama `raise_if_inactive()` entre etapas (checkpoint cooperativo do kill switch);
   - trata RPALicenseError como fim de execução;
+  - informa o status FINAL da execução (success / partial / error) no encerramento;
   - liga `on_warning` para ver o que a lib tem a dizer (a lib nunca imprime sozinha).
 
 Uso:
@@ -24,7 +25,14 @@ import time
 
 from dotenv import load_dotenv
 
-from trajetoria_logger import RPALicenseError, RPALoggerClient, RPALoggerConfig
+from trajetoria_logger import (
+    STATUS_ERROR,
+    STATUS_PARTIAL,
+    STATUS_SUCCESS,
+    RPALicenseError,
+    RPALoggerClient,
+    RPALoggerConfig,
+)
 
 load_dotenv()  # a aplicação carrega seu próprio ambiente (a LIB nunca faz isso)
 
@@ -57,6 +65,9 @@ def main() -> None:
         print(f"[RPA] {client.pending_logs} logs de execuções anteriores no buffer (vão como bulk)")
 
     emitted = 0
+    # Status final da execução. Começa como erro: se algo escapar sem ser tratado, é o que
+    # deve ficar registrado.
+    status, status_msg = STATUS_ERROR, None
     try:
         client.info("RPA iniciou", task="exemplo")
         emitted += 1
@@ -74,12 +85,19 @@ def main() -> None:
         client.info("RPA finalizou com sucesso", task="exemplo")
         emitted += 1
         print(f"[RPA] concluído — {emitted} logs emitidos")
+        status = STATUS_SUCCESS
     except RPALicenseError as exc:
         print(f"[RPA] PARADA COOPERATIVA no checkpoint: {exc}")
+        status, status_msg = STATUS_PARTIAL, f"interrompido pelo kill switch: {exc}"
+    except Exception as exc:
+        client.critical("RPA falhou", erro=str(exc), tipo=type(exc).__name__)
+        status_msg = f"{type(exc).__name__}: {exc}"
+        raise
     finally:
-        # close() drena o buffer e devolve o que não foi confirmado. Diferente de zero não
-        # é perda: sobe na próxima execução (fila bulk).
-        restantes = client.close()
+        # close(status=...) registra o status final e drena logs + status. O status só sobe
+        # depois dos logs desta execução. O que não for confirmado não é perda: fica no
+        # buffer e sobe na próxima execução.
+        restantes = client.close(status=status, message=status_msg)
         print(f"[RPA] encerrado. Logs emitidos: {emitted}; não confirmados: {restantes}")
 
 
