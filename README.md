@@ -169,7 +169,7 @@ Coloque-o **entre etapas** — num ponto onde interromper deixa o trabalho consi
 
 ```python
 finally:
-    # registra o status, drena logs + status (até 10s) e para o worker
+    # registra o status, drena logs + status (até 5 min) e para o worker
     restantes = logger.close(status=STATUS_SUCCESS)
     if restantes:
         print(f"{restantes} logs não confirmados — sobem na próxima execução")
@@ -186,6 +186,31 @@ logger.close()
 `close()` devolve quantos logs continuam **não confirmados**. Diferente de zero **não é
 perda**: eles ficam no arquivo do buffer e vão na próxima execução, pela fila de backlog. O
 status não confirmado segue a mesma regra (veja `logger.pending_executions`).
+
+#### Quanto tempo o `close()` espera (`drain_timeout`)
+
+O padrão é **300 s (5 min)**. É um **teto**, não uma espera fixa: com tudo confirmado, o
+`close()` retorna na hora. O prazo existe para o robô que gera muitos logs perto do fim:
+
+- o status só sobe **depois** de todos os logs da execução;
+- num teste local a ingestão ficou em torno de **250 logs/s**: 30 mil logs acumulados no fim
+  levam ~2 min. Com 10 s, sobrariam logs no buffer e o status iria junto para a próxima
+  execução, e o gerenciador veria a execução **sem status** até lá.
+
+| Situação | O `close()` |
+|---|---|
+| tudo confirmado | retorna na hora |
+| backlog grande, API no ar | espera até drenar (no máximo `drain_timeout`) |
+| **API fora** | espera o `drain_timeout` **inteiro** e encerra; o que sobrou sobe na próxima execução |
+| chave desativada (kill switch) | não espera: a API recusaria tudo |
+
+Se o robô **não pode** ficar até 5 min parado no encerramento quando a rede cai (por
+exemplo, quando outra automação começa logo depois na mesma máquina), passe um prazo menor.
+Nada se perde, só atrasa:
+
+```python
+logger.close(drain_timeout=30, status=STATUS_SUCCESS)
+```
 
 Detalhes do status em [Status de execução](#status-de-execução).
 
@@ -363,6 +388,16 @@ logger.close(status=STATUS_ERROR, message="portal fora do ar")
 
 Regras:
 
+- **O horário de finalização vai automaticamente.** `finish()` envia `finished_at` = o instante
+  da chamada. Com isso, um status que só sobe na execução seguinte (rede fora no fim) fica
+  registrado com o horário **real** de término, e não com o do reenvio. Para não enviar,
+  passe `send_finished_at=False` (também aceito em `close()`). A API registra então como
+  finalização o instante em que **recebeu** o status:
+
+  ```python
+  logger.finish(STATUS_SUCCESS, send_finished_at=False)
+  ```
+
 - **Um status por execução.** Uma segunda chamada a `finish()` é **ignorada** (vale a
   primeira) e avisa por `on_warning`. Ela não levanta exceção, porque costuma rodar num
   `finally`.
@@ -450,6 +485,7 @@ milhares de logs.
 | `batch_size` acima de 1000 | a API rejeita o lote e os logs travam no buffer |
 | esquecer o `logger.close()` | o buffer não é drenado no encerramento; os logs só sobem na execução seguinte |
 | esquecer o status final | a execução aparece **sem status** no gerenciador; use `close(status=...)` no `finally` |
+| `drain_timeout` curto em robô que loga muito | sobram logs no buffer, e o status (que espera os logs) só sobe na próxima execução; mantenha o padrão de 5 min |
 | `finish()` no meio da execução | é o status **final**: chamadas depois dele são ignoradas |
 | status como texto solto (`"ok"`, `"sucesso"`) | levanta `ValueError`; use `STATUS_SUCCESS` / `STATUS_PARTIAL` / `STATUS_ERROR` |
 | tratar `close() > 0` como perda | não é perda — é backlog, e ele sobe depois |

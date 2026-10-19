@@ -39,6 +39,10 @@ STATUS_PARTIAL = "partial"
 STATUS_ERROR = "error"
 _STATUSES = (STATUS_SUCCESS, STATUS_PARTIAL, STATUS_ERROR)
 
+# Teto de espera do `close()` para drenar logs + status. 5 min cobre algumas dezenas de
+# milhares de logs acumulados no fim da execução; com tudo confirmado, retorna na hora.
+DEFAULT_DRAIN_TIMEOUT = 300.0
+
 _BACKOFF_START = 1.0
 _BACKOFF_MAX = 30.0
 # Piso entre chamadas de licença: protege a API de ser martelada se o intervalo
@@ -121,13 +125,19 @@ class RPALoggerClient:
     def debug(self, message: str, **context) -> None:
         self.log(message, LEVEL_DEBUG, **context)
 
-    def finish(self, status: str, message: str | None = None) -> None:
+    def finish(
+        self, status: str, message: str | None = None, send_finished_at: bool = True
+    ) -> None:
         """Registra o status FINAL desta execução: `success`, `partial` ou `error`.
 
         Como `log()`, só grava no buffer local e retorna — o envio é do worker, depois que
         os logs desta execução subirem. Se a API estiver fora, o status fica no buffer e
         sobe na próxima execução do robô, com o `finished_at` original (o instante desta
         chamada).
+
+        `finished_at` é enviado AUTOMATICAMENTE (o instante desta chamada). Com
+        `send_finished_at=False` ele não vai, e a API registra como finalização o instante em
+        que RECEBEU o status — que, num reenvio a partir do buffer, pode ser bem depois.
 
         Um status por execução: uma segunda chamada é IGNORADA (vale o primeiro) e avisa por
         `on_warning`. Não levanta, porque costuma rodar num `finally` — derrubar o robô no
@@ -144,7 +154,8 @@ class RPALoggerClient:
         self._finished = True
         if message is not None:
             message = str(message)
-        if not self._buffer.add_execution(self._execution_id, status, message, time.time()):
+        finished_at = time.time() if send_finished_at else None
+        if not self._buffer.add_execution(self._execution_id, status, message, finished_at):
             self._warn(f"finish({status!r}) ignorado: esta execução já tem status")
 
     @property
@@ -180,15 +191,22 @@ class RPALoggerClient:
 
     def close(
         self,
-        drain_timeout: float = 10.0,
+        drain_timeout: float = DEFAULT_DRAIN_TIMEOUT,
         status: str | None = None,
         message: str | None = None,
+        send_finished_at: bool = True,
     ) -> int:
         """Tenta drenar o buffer (logs E status) antes de encerrar; depois para o worker.
 
-        `status` é atalho para `finish(status, message)` antes de drenar. Sem status nesta
-        execução, nada é enviado — ausência de status é informação (o gerenciador vê
-        "execução sem status") — e `on_warning` avisa.
+        `drain_timeout` é o TETO de espera, não uma espera fixa: com tudo confirmado, o
+        `close()` retorna na hora. O default (5 min) é para o robô que gera dezenas de
+        milhares de logs no fim conseguir entregar tudo — inclusive o status, que só sobe
+        depois dos logs. Com a API fora, porém, o encerramento espera o prazo inteiro; quem
+        não pode esperar passa um valor menor (o que sobrar sobe na próxima execução).
+
+        `status` é atalho para `finish(status, message, send_finished_at)` antes de drenar.
+        Sem status nesta execução, nada é enviado — ausência de status é informação (o
+        gerenciador vê "execução sem status") — e `on_warning` avisa.
 
         Devolve quantos logs continuam NÃO confirmados. Diferente de zero não é perda: eles
         ficam no arquivo do buffer e sobem na próxima execução do robô (fila bulk). O mesmo
@@ -197,7 +215,7 @@ class RPALoggerClient:
         invalid: ValueError | None = None
         if status is not None:
             try:
-                self.finish(status, message)
+                self.finish(status, message, send_finished_at)
             except ValueError as exc:
                 # Status inválido não pode deixar worker e SQLite abertos: encerra tudo e
                 # só então propaga o erro de programação.
@@ -205,8 +223,12 @@ class RPALoggerClient:
         elif not self._finished:
             self._warn("execução encerrada sem status (chame finish() ou close(status=...))")
         deadline = time.time() + max(0.0, drain_timeout)
-        while time.time() < deadline and (
-            self._buffer.count() > 0 or self._buffer.count_executions() > 0
+        # Com a chave desativada a API recusa tudo (403): esperar o prazo seria só travar o
+        # encerramento de um robô que o kill switch acabou de parar.
+        while (
+            time.time() < deadline
+            and self._active.is_set()
+            and (self._buffer.count() > 0 or self._buffer.count_executions() > 0)
         ):
             time.sleep(0.2)  # o worker (ainda vivo) continua drenando
         remaining = self._buffer.count()

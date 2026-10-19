@@ -96,13 +96,15 @@ class Buffer:
         # Status final das execuções (`finish()`), até a API confirmar. A PK em
         # `execution_id` é o que garante UM status por execução: um segundo `finish()` cai
         # no INSERT OR IGNORE e não gera envio nenhum. `finished_at` é epoch, como o
-        # `timestamp` dos logs — é o instante que trafega; `created_at` é para leitura humana.
+        # `timestamp` dos logs — é o instante que trafega; NULL quando o desenvolvedor optou
+        # por não enviá-lo (a API usa então o instante em que recebeu). `created_at` é o
+        # instante do `finish()` para leitura humana e ordenação, sempre preenchido.
         self._conn.execute(
             """CREATE TABLE IF NOT EXISTS pending_executions (
                    execution_id TEXT PRIMARY KEY,
                    status       TEXT NOT NULL,
                    message      TEXT,
-                   finished_at  REAL NOT NULL,
+                   finished_at  REAL,
                    created_at   TEXT NOT NULL,
                    attempts     INTEGER NOT NULL DEFAULT 0
                )"""
@@ -209,7 +211,7 @@ class Buffer:
 
     # ------------------------------------------------------------------ status de execução
     def add_execution(
-        self, execution_id: str, status: str, message: str | None, finished_at: float
+        self, execution_id: str, status: str, message: str | None, finished_at: float | None
     ) -> bool:
         """Grava o status final ANTES de qualquer rede, como os logs (R1).
 
@@ -220,7 +222,13 @@ class Buffer:
             cur = self._conn.execute(
                 "INSERT OR IGNORE INTO pending_executions "
                 "(execution_id, status, message, finished_at, created_at) VALUES (?, ?, ?, ?, ?)",
-                (execution_id, status, message, float(finished_at), local_iso(finished_at, self._tz)),
+                (
+                    execution_id,
+                    status,
+                    message,
+                    None if finished_at is None else float(finished_at),
+                    local_iso(time.time() if finished_at is None else finished_at, self._tz),
+                ),
             )
             self._conn.commit()
             return _changes(cur.rowcount, 1) > 0
@@ -230,7 +238,7 @@ class Buffer:
         with self._lock:
             rows = self._conn.execute(
                 "SELECT execution_id, status, message, finished_at FROM pending_executions "
-                "ORDER BY finished_at ASC"
+                "ORDER BY created_at ASC"  # largura fixa: ordem lexicográfica = cronológica
             ).fetchall()
         return [
             {"execution_id": e, "status": s, "message": m, "finished_at": f}

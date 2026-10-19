@@ -147,7 +147,9 @@ class HttpTransport:
     # ------------------------------------------------------------------ status de execução
     def send_execution(self, entry: dict) -> ExecutionResult:
         """`POST /executions`. Mesma tradução de códigos de `send_batch`, para um item só."""
-        body = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        # Campos None saem do corpo: sem `finished_at`, a API usa o instante em que recebeu.
+        payload = {k: v for k, v in entry.items() if v is not None}
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
         try:
             resp = self._session.post(
                 f"{self._base}/executions", data=body, timeout=self._timeout
