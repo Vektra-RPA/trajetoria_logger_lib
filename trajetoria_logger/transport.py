@@ -44,6 +44,16 @@ class BatchResult:
     error: str | None = None
 
 
+@dataclass
+class ExecutionResult:
+    accepted: bool = False
+    # Motivo da rejeição PERMANENTE (422): sai do buffer, senão travaria em reenvio eterno.
+    dropped: str | None = None
+    license: LicenseSnapshot | None = None
+    retry_after: float | None = None
+    error: str | None = None
+
+
 class HttpTransport:
     """Fala com a nossa API. Mantém a sessão aberta (keep-alive) entre batches."""
 
@@ -133,6 +143,38 @@ class HttpTransport:
             dropped=dropped,
             license=_snapshot_from(data.get("license") or {}),
         )
+
+    # ------------------------------------------------------------------ status de execução
+    def send_execution(self, entry: dict) -> ExecutionResult:
+        """`POST /executions`. Mesma tradução de códigos de `send_batch`, para um item só."""
+        body = json.dumps(entry, ensure_ascii=False).encode("utf-8")
+        try:
+            resp = self._session.post(
+                f"{self._base}/executions", data=body, timeout=self._timeout
+            )
+        except requests.RequestException as exc:
+            # Sem resposta: fica no buffer. Reenviar é seguro — a API deduplica por execução.
+            return ExecutionResult(error=f"{type(exc).__name__}: {exc}")
+
+        if resp.status_code == 403:
+            return ExecutionResult(license=LicenseSnapshot(active=False), error="chave desativada")
+        if resp.status_code == 401:
+            return ExecutionResult(error="chave não reconhecida pela API")
+        if resp.status_code == 422:
+            # Payload que a API nunca vai aceitar: reenviar não resolve, descarta.
+            return ExecutionResult(dropped=f"rejeitado pela API: {resp.text[:200]}")
+        if resp.status_code in (429, 503):
+            return ExecutionResult(
+                retry_after=_retry_after(resp), error=f"API ocupada/indisponível ({resp.status_code})"
+            )
+        if resp.status_code >= 400:
+            return ExecutionResult(error=f"HTTP {resp.status_code}: {resp.text[:200]}")
+
+        try:
+            data = resp.json()
+        except ValueError:
+            data = {}
+        return ExecutionResult(accepted=True, license=_snapshot_from(data.get("license") or {}))
 
     def close(self) -> None:
         try:

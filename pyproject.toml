@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "trajetoria-logger"
-version = "1.1.1"
+version = "1.2.0"
 description = "Logging com garantia de entrega (buffer local + confirmação) e kill switch para RPAs"
 readme = "README.md"
 requires-python = ">=3.11"

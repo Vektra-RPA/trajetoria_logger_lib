@@ -6,11 +6,35 @@ A lib grava cada log num buffer local (SQLite) **antes de qualquer rede** e um w
 drena esse buffer enviando lotes para a nossa API por HTTPS. Um log só sai do buffer quando a
 API **confirma** aquele `log_id`.
 
+No fim da execução, o robô informa o **status final** (`success`, `partial` ou `error`) com
+`finish()`. Ele segue o mesmo caminho: buffer local primeiro, envio pelo worker, e só sai do
+buffer depois de confirmado.
+
 ```
 seu RPA → trajetoria_logger (buffer SQLite) ──HTTPS POST /logs/batch──▶ API Trajetória
-                                                                          │
+                                            ──HTTPS POST /executions──▶      │
                                                                     RabbitMQ → PostgreSQL
 ```
+
+> **Este README é instalado junto com a lib**, em `site-packages/trajetoria_logger/README.md`.
+> Para achá-lo em qualquer máquina (útil para quem integra a lib, pessoa ou assistente de
+> código, sem acesso a este repositório):
+>
+> ```bash
+> python -c "import trajetoria_logger; print(trajetoria_logger.README_PATH)"
+> ```
+
+### Resumo para integrar
+
+1. Configure com `RPALoggerConfig(api_key=..., api_base_url=..., buffer_path=<caminho absoluto>)`.
+   A chave vem do ambiente da **aplicação**, nunca do código.
+2. Instancie `RPALoggerClient(config)` dentro de `try/except RPALicenseError`.
+3. Logue com `info()/warning()/error()/critical()/debug()`; `**kwargs` viram o `context`.
+4. Chame `raise_if_inactive()` **entre etapas** (kill switch cooperativo).
+5. No `finally`, chame `close(status=..., message=...)` com `STATUS_SUCCESS`, `STATUS_PARTIAL`
+   ou `STATUS_ERROR`. **Um status por execução.**
+
+O modelo pronto para copiar está em [O bloco completo](#o-bloco-completo).
 
 > **A lib fala com um único destino: a nossa API.** Ela não conhece RabbitMQ, não recebe
 > credencial de infraestrutura e não abre porta nenhuma. Também **não lê `.env` nem variáveis
@@ -22,15 +46,15 @@ seu RPA → trajetoria_logger (buffer SQLite) ──HTTPS POST /logs/batch──
 ## Instalação
 
 ```bash
-pip install "git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.1"
+pip install "git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.2.0"
 ```
 
 ## Instalação via requirements.txt
 ```bash
-trajetoria-logger @ git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.1.1
+trajetoria-logger @ git+https://github.com/Vektra-RPA/trajetoria_logger_lib.git@v1.2.0
 ```
 
-HTTPS **não pede credencial** — o repositório é público para leitura. O `@v1.1.1` fixa a
+HTTPS **não pede credencial** — o repositório é público para leitura. O `@v1.2.0` fixa a
 versão. Requer `git` instalado: o pip clona o repositório e monta o pacote na máquina.
 
 > **Não use `git+ssh://`.** SSH exige chave autorizada na organização mesmo com o repositório
@@ -41,7 +65,7 @@ Se a máquina não tem `git`, ou não tem saída para o GitHub, instale pelo whe
 `py3-none-any`, então o mesmo arquivo serve Windows e Linux:
 
 ```bash
-pip install ./trajetoria_logger-1.1.1-py3-none-any.whl
+pip install ./trajetoria_logger-1.2.0-py3-none-any.whl
 ```
 
 Gere o wheel com `python -m build --wheel` (sai em `dist/`). Para uma máquina que também não
@@ -141,24 +165,43 @@ for i, item in enumerate(itens, 1):
 nem mata sua thread. Ela só marca o estado; quem decide parar é você, ao chamar o checkpoint.
 Coloque-o **entre etapas** — num ponto onde interromper deixa o trabalho consistente.
 
-### 5. Encerre com `close()`, sempre num `finally`
+### 5. Informe o status final e encerre com `close()`, sempre num `finally`
 
 ```python
 finally:
-    restantes = logger.close()     # drena o buffer (até 10s) e para o worker
+    # registra o status, drena logs + status (até 10s) e para o worker
+    restantes = logger.close(status=STATUS_SUCCESS)
     if restantes:
         print(f"{restantes} logs não confirmados — sobem na próxima execução")
 ```
 
+`close(status=..., message=...)` é atalho para `finish(status, message)` seguido do
+encerramento. Os dois jeitos são equivalentes:
+
+```python
+logger.finish(STATUS_PARTIAL, message="3 de 5 notas emitidas")
+logger.close()
+```
+
 `close()` devolve quantos logs continuam **não confirmados**. Diferente de zero **não é
-perda**: eles ficam no arquivo do buffer e vão na próxima execução, pela fila de backlog.
+perda**: eles ficam no arquivo do buffer e vão na próxima execução, pela fila de backlog. O
+status não confirmado segue a mesma regra (veja `logger.pending_executions`).
+
+Detalhes do status em [Status de execução](#status-de-execução).
 
 ### O bloco completo
 
 ```python
 import os
 
-from trajetoria_logger import RPALicenseError, RPALoggerClient, RPALoggerConfig
+from trajetoria_logger import (
+    STATUS_ERROR,
+    STATUS_PARTIAL,
+    STATUS_SUCCESS,
+    RPALicenseError,
+    RPALoggerClient,
+    RPALoggerConfig,
+)
 
 config = RPALoggerConfig(
     api_key=os.environ["RPA_API_KEY"],
@@ -174,26 +217,40 @@ except RPALicenseError as exc:
 
 print(f"execução {logger.execution_id} (robot_id={logger.robot_id})")
 
+# Começa como erro: se algo escapar sem tratamento, é o que deve ficar registrado.
+status, motivo = STATUS_ERROR, None
+
 try:
     logger.info("robô iniciou", task="faturamento")
 
+    falhas = 0
     for etapa in etapas:
         logger.raise_if_inactive()
         logger.info("etapa iniciada", etapa=etapa.nome)
-        etapa.executar()
+        try:
+            etapa.executar()
+        except ErroDeNegocio as exc:            # exceção de negócio do SEU robô: segue
+            falhas += 1
+            logger.error("etapa falhou", etapa=etapa.nome, erro=str(exc))
 
-    logger.info("robô finalizou com sucesso")
+    if falhas:
+        status, motivo = STATUS_PARTIAL, f"{falhas} de {len(etapas)} etapas falharam"
+    else:
+        status = STATUS_SUCCESS
+    logger.info("robô finalizou", status=status)
 
 except RPALicenseError as exc:
     # Kill switch acionado NO MEIO da execução: parada limpa, não é falha do robô.
     print(f"parada cooperativa: {exc}")
+    status, motivo = STATUS_PARTIAL, f"interrompido pelo kill switch: {exc}"
 
 except Exception as exc:
     logger.critical("robô falhou", erro=str(exc), tipo=type(exc).__name__)
+    motivo = f"{type(exc).__name__}: {exc}"
     raise
 
 finally:
-    restantes = logger.close()
+    restantes = logger.close(status=status, message=motivo)
     if restantes:
         print(f"{restantes} logs não confirmados — sobem na próxima execução")
 ```
@@ -226,6 +283,7 @@ finally:
 | `logger.execution_id` | UUID desta execução. Agrupa os logs no banco. |
 | `logger.is_active` | `False` quando o kill switch foi acionado. |
 | `logger.pending_logs` | Logs ainda não confirmados, incluindo backlog de execuções anteriores. |
+| `logger.pending_executions` | Status de execução ainda não confirmados (inclui os de execuções anteriores). |
 
 ---
 
@@ -286,6 +344,50 @@ O `context` é JSON livre: `logger.error("falha no item", item_id=42, tentativa=
 
 ---
 
+## Status de execução
+
+Ao terminar, o robô informa **como** a execução terminou. É o que o gerenciador usa para dizer
+"essa execução deu certo?" sem inferir isso dos níveis de log.
+
+| Constante | Valor | Quando usar |
+|---|---|---|
+| `STATUS_SUCCESS` | `"success"` | tudo o que devia ser feito foi feito |
+| `STATUS_PARTIAL` | `"partial"` | parte do trabalho foi feita (itens com falha, parada pelo kill switch) |
+| `STATUS_ERROR` | `"error"` | a execução falhou e o trabalho não foi entregue |
+
+```python
+logger.finish(STATUS_PARTIAL, message="3 de 5 notas emitidas")   # message é opcional
+# ou, no encerramento:
+logger.close(status=STATUS_ERROR, message="portal fora do ar")
+```
+
+Regras:
+
+- **Um status por execução.** Uma segunda chamada a `finish()` é **ignorada** (vale a
+  primeira) e avisa por `on_warning`. Ela não levanta exceção, porque costuma rodar num
+  `finally`.
+- **Status fora do vocabulário levanta `ValueError`.** É erro de programação, não de execução.
+  Com `close(status=...)`, o cliente é encerrado normalmente antes do erro subir.
+- **Sem status, nada é enviado.** Fechar sem `finish()` só avisa por `on_warning`. A ausência
+  de status também é informação: o gerenciador vê a execução **sem status** (crash, robô
+  morto, esquecimento).
+- **Logs primeiro.** O status só é enviado depois que todos os logs **daquela execução** foram
+  confirmados. Assim, quem lê o status já encontra os logs completos.
+- **Mesma garantia dos logs.** `finish()` grava no buffer e retorna, sem rede. Se a API estiver
+  fora no encerramento, o status fica no `rpa_buffer.db` e sobe na **próxima execução** com o
+  horário original (`finished_at` = instante do `finish()`), não o do reenvio.
+
+O que acontece com o envio, por resposta da API:
+
+| Resposta | A lib |
+|---|---|
+| `202` | tira do buffer |
+| `422` | descarta (rejeição permanente) e avisa |
+| `403` | kill switch, como nos logs |
+| `401`, `429`, `503`, rede fora | mantém no buffer e tenta de novo com backoff |
+
+---
+
 ## Kill switch (R2)
 
 A regra é uma só:
@@ -325,6 +427,9 @@ O que sustenta a garantia, elo por elo:
 3. a API só confirma o que o broker confirmou ter persistido;
 4. cada log tem um `log_id` único, e o servidor **deduplica** por ele.
 
+O status de execução segue os mesmos elos: grava no buffer em `finish()`, só sai após a
+confirmação da API e é deduplicado por `execution_id`, tanto no buffer quanto no servidor.
+
 Consequência prática: **reenviar é sempre seguro**. Se um POST der timeout depois de o
 servidor já ter gravado, o reenvio não duplica nada.
 
@@ -344,6 +449,9 @@ milhares de logs.
 | dois robôs no mesmo `buffer_path` | o worker drena tudo com a *sua* chave e os logs trocam de dono |
 | `batch_size` acima de 1000 | a API rejeita o lote e os logs travam no buffer |
 | esquecer o `logger.close()` | o buffer não é drenado no encerramento; os logs só sobem na execução seguinte |
+| esquecer o status final | a execução aparece **sem status** no gerenciador; use `close(status=...)` no `finally` |
+| `finish()` no meio da execução | é o status **final**: chamadas depois dele são ignoradas |
+| status como texto solto (`"ok"`, `"sucesso"`) | levanta `ValueError`; use `STATUS_SUCCESS` / `STATUS_PARTIAL` / `STATUS_ERROR` |
 | tratar `close() > 0` como perda | não é perda — é backlog, e ele sobe depois |
 | esperar que a lib pare o robô sozinha | a parada é **cooperativa**: sem `raise_if_inactive()`, o kill switch não interrompe nada |
 | `verify_tls=False` em produção | desliga a verificação do certificado |
@@ -355,7 +463,7 @@ milhares de logs.
 | Módulo | Responsabilidade |
 |---|---|
 | `client.py` | `RPALoggerClient`: API pública + worker (thread daemon) que drena o buffer, revalida a licença e aplica backoff |
-| `buffer.py` | `Buffer`: store-and-forward em SQLite; a única saída de um log é `mark_sent`, após confirmação |
+| `buffer.py` | `Buffer`: store-and-forward em SQLite (logs e status de execução); a única saída é após confirmação da API |
 | `transport.py` | `HttpTransport`: único canal de saída (HTTPS). Traduz status HTTP em decisão (confirmar, reter, parar) |
 | `license.py` | `LicenseGuard`: política do kill switch. Puro — não faz I/O |
 | `config.py` | `RPALoggerConfig`: configuração explícita, recebida da aplicação |
@@ -369,7 +477,7 @@ A lib é segura para chamar `log()` de várias threads (o buffer é protegido po
 Em `examples/`, rodáveis com `pip install -e ".[dev]"`:
 
 - **`exemplo_rpa.py`** — RPA completo: config, níveis, checkpoints, tratamento de
-  `RPALicenseError` e encerramento. `python examples/exemplo_rpa.py <API_KEY> [n_etapas]`
+  `RPALicenseError` e encerramento com status final. `python examples/exemplo_rpa.py <API_KEY> [n_etapas]`
 - **`smoke_ingest.py`** — prova de R1 isolada: mostra que nada sai do buffer sem confirmação,
   inclusive com a API inalcançável. `python examples/smoke_ingest.py <API_KEY>`
 
